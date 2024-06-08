@@ -266,4 +266,61 @@
 						R[3] = a0()
 					end
 					R[4] = a0()
-	
+					if (type(R[3]) ~= "table") then
+						warn("Settings table malformed, please make sure you have the exact table copied! { ARG4_INVALID_TABLE }")
+						R[3] = a0()
+					end
+					for U, V in next, R[3] do
+						if (type(V) == "table") then
+							for W, X in next, V do
+								R[4][U][W] = X
+							end
+						else
+							R[4][U] = V
+						end
+					end
+					local Y = b.CreateWallNotification(R[1], R[2], R[4])
+					b.InsertWallNotification(Y[1], Y[2])
+				end)(...)
+			end
+			b.ClearAllNotifications = function()
+				for k, a7 in next, game:GetService("CoreGui"):GetChildren() do
+					if ((string.match(a7.Name, "WallNotificationFolder") or string.match(a7.Name, "NotificationFolder")) and a7:IsA("Folder")) then
+						for P, a8 in next, a7:GetChildren() do
+							pcall(function()
+								a8:Destroy()
+							end)
+						end
+					end
+				end
+			end
+			if not getgenv then
+				b.WallNotification("Error", "Your Exploit is not Supported T-T\n\nPlease download a supported Exploit!", {Duration=(8999999488 or 1),TitleSettings={Enabled=true},DescriptionSettings={Font=Enum.Font.Code}})
+				while wait() do
+				end
+			end
+			getgenv().IrisNotificationUserMrJack = b
+		end
+		if not IrisNotificationUserIcon then
+			local a9 = 0
+			pcall(function()
+				a9 = game:GetService("MarketplaceService"):GetProductInfo(game:GetService("AssetService"):GetGamePlacesAsync():GetCurrentPage()[1].PlaceId).IconImageAssetId
+			end)
+			getgenv().IrisNotificationUserIcon = "rbxassetid://" .. a9
+			if (not IrisNotificationUserIcon or (IrisNotificationUserIcon == "rbxassetid://0")) then
+				getgenv().IrisNotificationUserIcon = "rbxassetid://7141323263"
+			end
+		end
+	end
+	a()
+	getgenv().Notification = function(type, aa, ab, ac, ad)
+		a()
+		if (aa and (aa == "Test")) then
+			aa = "Error"
+		end
+		if (type == 1) then
+			IrisNotificationUserMrJack.Notify(aa, ab, ad or "rbxassetid://13241550901", {Duration=(ac or 1),TitleSettings={TextColor3=Color3.fromRGB(255, 0, 0),TextXAlignment=Enum.TextXAlignment.Right},DescriptionSettings={TextColor3=Color3.fromRGB(240, 240, 240),TextXAlignment=Enum.TextXAlignment.Center,TextYAlignment=Enum.TextYAlignment.Center},GradientSettings={GradientEnabled=false,SolidColor=Color3.fromRGB(255, 0, 0),Extend=true},Main={BorderColor3=Color3.fromRGB(0, 0, 0),BackgroundColor3=Color3.fromRGB(0, 0, 0),BackgroundTransparency=0.5,Rounding=false,BorderSizePixel=0}})
+		elseif (type == 2) then
+			IrisNotificationUserMrJack.WallNotification(aa, ab, {Duration=(ac or 1),TitleSettings={Enabled=true,TextColor3=Color3.fromRGB(255, 0, 0)},DescriptionSettings={Font=Enum.Font.Code}})
+		end
+	end
