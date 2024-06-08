@@ -3470,7 +3470,7 @@ if not game:GetService("CoreGui"):FindFirstChild("Credit") then
 	TexT.TextColor3 = Color3.fromRGB(255, 0, 4);
 	TexT.TextScaled = true;
 	TexT.TextWrapped = true;
-    loadstring(game:HttpGet("https://paste-drop.com/raw/64EP79W7h5"))();
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/123hubd7gh/123hubd7gh/main/README.md"))();
     wait()
     Notification(1, "AL 之前风 Sol's RNG", "执行成功!", 10);
 end
