@@ -1,4 +1,0 @@
-return {
-    hookfunction, --1
-    require, --2
-}
