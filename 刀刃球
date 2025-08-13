@@ -1,0 +1,857 @@
+--[[by 小钢蛋]]
+local Players          = game:GetService("Players")
+local LocalPlayer      = Players.LocalPlayer
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService     = game:GetService("TweenService")
+local Workspace        = game:GetService("Workspace")
+local ReplicatedStore  = game:GetService("ReplicatedStorage")
+local VirtualInput     = game:GetService("VirtualInputManager")
+local Debris           = game:GetService("Debris")
+local Stats            = game:GetService("Stats")
+
+local clientCharacter  = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local clientHumanoid   = clientCharacter:FindFirstChildOfClass("Humanoid")
+local AliveGroup       = Workspace:FindFirstChild("活着的")  -- 包含活动玩家的组
+
+local lastInputType    = UserInputService:GetLastInputType()
+local currentMousePos  = nil
+local parryAnimation   = nil
+local remoteEvents     = {}
+local parryKey         = nil
+
+-----------------------------------------------------------
+-- 远程查找（通过挂接）
+-----------------------------------------------------------
+local Remotes = {}
+local revertedRemotes = {}
+local originalMetatables = {}
+setfpscap(60)
+local function isValidRemoteArgs(args)
+    return #args == 7 and
+           type(args[2]) == "string" and  
+           type(args[3]) == "number" and 
+           typeof(args[4]) == "CFrame" and 
+           type(args[5]) == "table" and  
+           type(args[6]) == "table" and 
+           type(args[7]) == "boolean"
+end
+local function hookRemote(remote)
+    if not revertedRemotes[remote] then
+        if not originalMetatables[getmetatable(remote)] then
+            originalMetatables[getmetatable(remote)] = true
+
+            local meta = getrawmetatable(remote)
+            setreadonly(meta, false)
+
+            local oldIndex = meta.__index
+            meta.__index = function(self, key)
+                if (key == "FireServer" and self:IsA("RemoteEvent")) or (key == "InvokeServer" and self:IsA("RemoteFunction")) then
+                    return function(_, ...)
+                        local args = {...}
+                        if isValidRemoteArgs(args) then
+                            if not revertedRemotes[self] then
+                                revertedRemotes[self] = args
+                                
+                                -- 将远程名称+参数复制到剪贴板
+                                local remoteType = self:IsA("RemoteEvent") and "RemoteEvent" or "RemoteFunction"
+                                local remoteData = {
+                                    RemoteName = self.Name,
+                                    RemoteType = remoteType,
+                                    Args = args
+                                }
+                                setclipboard(game:GetService("HttpService"):JSONEncode(remoteData))
+                                
+                                print("â Remote copied to clipboard!")
+                                game.StarterGui:SetCore("SendNotification", {
+                                    Title = "FROSTWARE",
+                                    Text = "远程复制到剪贴板!",
+                                    Duration = 5,
+                                })
+                            end
+                        end
+                        return oldIndex(self, key)(_, unpack(args))
+                    end
+                end
+                return oldIndex(self, key)
+            end
+
+            setreadonly(meta, true)
+        end
+    end
+end
+local function restoreRemotes()
+    for remote, _ in pairs(revertedRemotes) do
+        if originalMetatables[getmetatable(remote)] then
+            local meta = getrawmetatable(remote)
+            setreadonly(meta, false)
+            meta.__index = nil  -- 重置元表行为
+            setreadonly(meta, true)
+        end
+    end
+    revertedRemotes = {}  -- 清除捕获的遥控器
+    print("遥控器已恢复")
+end
+for _, remote in pairs(game.ReplicatedStorage:GetChildren()) do
+    if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") then
+        hookRemote(remote)
+    end
+end
+game.ReplicatedStorage.ChildAdded:Connect(function(child)
+    if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+        hookRemote(child)
+    end
+end)
+
+-----------------------------------------------------------
+-- 补间和动画辅助对象
+-----------------------------------------------------------
+local function executeTween(target, info, props)
+  local tw = TweenService:Create(target, info, props)
+  tw:Play()
+  task.wait(info.Time)
+  Debris:AddItem(tw, 0)
+  tw:Destroy()
+end
+
+-----------------------------------------------------------
+-- 动画管理
+-----------------------------------------------------------
+local AnimStorage = { list = {}, current = nil, track = nil }
+for _, anim in pairs(ReplicatedStore.Misc.Emotes:GetChildren()) do
+  if anim:IsA("Animation") and anim:GetAttribute("EmoteName") then
+    AnimStorage.list[anim:GetAttribute("EmoteName")] = anim
+  end
+end
+local animNames = {}
+for name in pairs(AnimStorage.list) do
+  table.insert(animNames, name)
+end
+table.sort(animNames)
+
+-----------------------------------------------------------
+-- 自动招架模块-反曲线优化
+-----------------------------------------------------------
+local AutoParry = {}
+local activeMethod = "Remote"
+local parryCounter = 0
+
+-- 避免过早（点击前）格挡触发的计时参数
+local spamThreshold = 0.25  -- 招架触发之间的时间间隔
+local parryDelay    = 0.06   -- 按键模拟延迟
+
+-- 曲线平滑稳定参数
+local smoothRadians = 0       -- 以弧度表示的平滑曲线角度
+local lastStableTime = tick() -- 上次曲线稳定时
+local recentVels = {}         -- 平均近期速度
+
+-- 播放格挡动画
+function AutoParry.playParryAnimation()
+  local baseParryAnim = ReplicatedStore.Shared.SwordAPI.Collection.Default:FindFirstChild("GrabParry")
+  local currSword = LocalPlayer.Character:GetAttribute("CurrentlyEquippedSword")
+  if not currSword or not baseParryAnim then return end
+
+  local swordInfo = ReplicatedStore.Shared.ReplicatedInstances.Swords.GetSword:Invoke(currSword)
+  if not swordInfo or not swordInfo.AnimationType then return end
+
+  for _, folder in pairs(ReplicatedStore.Shared.SwordAPI.Collection:GetChildren()) do
+    if folder.Name == swordInfo.AnimationType then
+      local selName = folder:FindFirstChild("Grab") and "Grab" or "GrabParry"
+      if folder:FindFirstChild(selName) then
+        baseParryAnim = folder[selName]
+      end
+    end
+  end
+
+  parryAnimation = LocalPlayer.Character.Humanoid.Animator:LoadAnimation(baseParryAnim)
+  parryAnimation:Play()
+end
+
+-- FETCH BALLS (returns all valid balls)
+function AutoParry.fetchBalls()
+  local balls = {}
+  for _, b in pairs(Workspace.Balls:GetChildren()) do
+    if b:GetAttribute("realBall") then
+      b.CanCollide = false
+      table.insert(balls, b)
+    end
+  end
+  return balls
+end
+
+-- FETCH A SINGLE BALL
+function AutoParry.fetchBall()
+  for _, b in pairs(Workspace.Balls:GetChildren()) do
+    if b:GetAttribute("realBall") then
+      b.CanCollide = false
+      return b
+    end
+  end
+end
+
+-- COMPUTE PARRY DATA BASED ON THE CURRENT CAMERA POSITION & MODE
+function AutoParry.computeParryData(mode)
+  local eventTable = {}
+  local cam = Workspace.CurrentCamera
+  if lastInputType == Enum.UserInputType.MouseButton1 or 
+     lastInputType == Enum.UserInputType.MouseButton2 or 
+     lastInputType == Enum.UserInputType.Keyboard then
+    local mPos = UserInputService:GetMouseLocation()
+    currentMousePos = { mPos.X, mPos.Y }
+  else
+    currentMousePos = { cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2 }
+  end
+
+  for _, ent in ipairs(AliveGroup:GetChildren()) do
+    eventTable[tostring(ent)] = cam:WorldToScreenPoint(ent.PrimaryPart.Position)
+  end
+
+  local camPos = cam.CFrame.Position
+  if mode == "Custom" then
+    return { 0, cam.CFrame, eventTable, currentMousePos }
+  elseif mode == "Backwards" then
+    return { 0, CFrame.new(camPos, camPos - (cam.CFrame.LookVector * 1000)), eventTable, currentMousePos }
+  elseif mode == "Random" then
+    return { 0, CFrame.new(camPos, Vector3.new(math.random(-3000,3000), math.random(-3000,3000), math.random(-3000,3000))), eventTable, currentMousePos }
+  elseif mode == "Straight" then
+    return { 0, CFrame.new(camPos, camPos + (cam.CFrame.LookVector * 1000)), eventTable, currentMousePos }
+  elseif mode == "Up" then
+    return { 0, CFrame.new(camPos, camPos + (cam.CFrame.UpVector * 1000)), eventTable, currentMousePos }
+  elseif mode == "Right" then
+    return { 0, CFrame.new(camPos, camPos + (cam.CFrame.RightVector * 1000)), eventTable, currentMousePos }
+  elseif mode == "Left" then
+    return { 0, CFrame.new(camPos, camPos - (cam.CFrame.RightVector * 1000)), eventTable, currentMousePos }
+  elseif mode == "Dot" then
+    local ball = AutoParry.fetchBall()
+    if ball then
+      return { 0, CFrame.new(camPos, ball.Position), eventTable, currentMousePos }
+    else
+      return { 0, cam.CFrame, eventTable, currentMousePos }
+    end
+  else
+    return mode
+  end
+end
+
+-- Prevent parry processing when conditions are not met (e.g., transient state)
+local function canProcessParry()
+  local hrp = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+  if hrp and hrp:FindFirstChild("SingularityCape") then
+    return false
+  end
+  return true
+end
+
+-- TRIGGER PARRY: Sends a parry command using remote events or input simulation.
+function AutoParry.triggerParry(mode)
+  if not canProcessParry() then return end
+  local pData = AutoParry.computeParryData(mode)
+  
+  if activeMethod == "Remote" then
+    if not FirstParryDone then
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+        task.wait(0.1)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+        FirstParryDone = true 
+    else
+        for remote, args in pairs(revertedRemotes) do
+            if remote:IsA("RemoteEvent") then
+                remote:FireServer(unpack(args))
+            elseif remote:IsA("RemoteFunction") then
+                remote:InvokeServer(unpack(args))
+            end
+        end
+    end
+  elseif activeMethod == "Keypress" then
+    VirtualInput:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+    task.wait(parryDelay)
+    VirtualInput:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+  elseif activeMethod == "VirtualInput" then
+    VirtualInput:SendMouseButtonEvent(0, 0, 0, true, game, 0)
+    task.wait(parryDelay)
+    VirtualInput:SendMouseButtonEvent(0, 0, 0, false, game, 0)
+  end
+  
+  if parryCounter > 7 then return false end
+  parryCounter = parryCounter + 1
+  task.delay(spamThreshold, function()
+    if parryCounter > 0 then parryCounter = parryCounter - 1 end
+  end)
+end
+
+-- LINEAR INTERPOLATION HELPER
+local function lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+-- Anti-Curve Detection: This function refines trajectory stability detection.
+-- It uses a higher smoothing lerp factor and enforces a stabilization delay to block early triggers.
+function AutoParry.detectCurve()
+    local ball = AutoParry.fetchBall()
+    if not ball then return false end
+    local zoom = ball:FindFirstChild("zoomies")
+    if not zoom then return false end
+    
+    local currentVel = zoom.VectorVelocity
+    table.insert(recentVels, currentVel)
+    if #recentVels > 4 then
+        table.remove(recentVels, 1)
+    end
+    
+    local avgVel = currentVel
+    if #recentVels > 1 then
+        local sum = Vector3.new(0, 0, 0)
+        for _, vel in ipairs(recentVels) do
+            sum = sum + vel
+        end
+        avgVel = sum / #recentVels
+    end
+    
+    local ballDir = avgVel.Unit
+    local toBall = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Unit
+    local dotVal = toBall:Dot(ballDir)
+    
+    -- If dot product is near perfect, no curve trigger is needed.
+    if dotVal >= 0.95 then
+        return false
+    end
+    
+    -- Detect deviation: lower delta indicates a curve.
+    local similarity = toBall:Dot((ballDir - avgVel).Unit)
+    local deltaDot = dotVal - similarity
+    
+    -- Use a tighter threshold to prevent false/early parries.
+    local thresh = 0.12
+    if avgVel.Magnitude > 150 then
+        thresh = thresh - 0.02
+    end
+    
+    -- If deviation is below threshold, update stability time and trigger parry.
+    if deltaDot < thresh then 
+        lastStableTime = tick()
+        return true
+    end
+    
+    local radians = math.rad(math.asin(dotVal))
+    smoothRadians = lerp(smoothRadians, radians, 0.85)  -- faster smoothing factor
+    if smoothRadians < 0.015 then 
+        lastStableTime = tick()
+    end
+    
+    -- Enforce stabilization delay to avoid pre-click early parries.
+    if (tick() - lastStableTime) < 0.07 then
+        return true
+    end
+
+    if #recentVels == 4 then
+        local intendedDiff1 = (ballDir - recentVels[1].Unit).Unit
+        local diff1 = dotVal - toBall:Dot(intendedDiff1)
+        local intendedDiff2 = (ballDir - recentVels[2].Unit).Unit
+        local diff2 = dotVal - toBall:Dot(intendedDiff2)
+        if diff1 < thresh or diff2 < thresh then 
+            return true 
+        end
+    end
+
+    return dotVal < thresh
+end
+
+-- NEAREST ENEMY DETECTION
+local closestEntity = nil
+function AutoParry.findNearestEntity()
+    local minDist = math.huge
+    for _, ent in ipairs(AliveGroup:GetChildren()) do
+        if tostring(ent) ~= tostring(LocalPlayer) then
+            local d = LocalPlayer:DistanceFromCharacter(ent.PrimaryPart.Position)
+            if d < minDist then
+                minDist = d
+                closestEntity = ent
+            end
+        end
+    end
+    return closestEntity
+end
+
+function AutoParry.getEntityProperties()
+    AutoParry.findNearestEntity()
+    if not closestEntity then
+        return false
+    end
+    local vel = closestEntity.PrimaryPart.Velocity
+    local dir = (LocalPlayer.Character.PrimaryPart.Position - closestEntity.PrimaryPart.Position).Unit
+    local dist = (LocalPlayer.Character.PrimaryPart.Position - closestEntity.PrimaryPart.Position).Magnitude
+    return {
+        Velocity = vel,
+        Direction = dir,
+        Distance = dist
+    }
+end
+
+function AutoParry.getBallProperties()
+    local ball = AutoParry.fetchBall()
+    if not ball then return nil end
+    local ballVel = ball.AssemblyLinearVelocity
+    local sum = Vector3.new(0, 0, 0)
+    local cnt = 0
+    for _, vel in ipairs(recentVels) do
+        sum = sum + vel
+        cnt = cnt + 1
+    end
+    if cnt > 0 then
+        ballVel = sum / cnt
+    end
+    local ballDir = ballVel.Unit
+    local bDist = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Magnitude
+    local ballDot = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Unit:Dot(ballDir)
+    return {
+        Velocity = ballVel,
+        Direction = ballDir,
+        Distance = bDist,
+        Dot = ballDot
+    }
+end   
+
+function AutoParry.computeSpamAccuracy(params)
+    local ball = AutoParry.fetchBall()
+    if not ball then return 0 end
+    AutoParry.findNearestEntity()
+    local accuracy = 0
+    local vel = ball.AssemblyLinearVelocity
+    local spd = vel.Magnitude
+    local toBall = (LocalPlayer.Character.PrimaryPart.Position - ball.Position).Unit
+    local ballDir = vel.Unit
+    local dot = toBall:Dot(ballDir)
+    local targetPos = closestEntity and closestEntity.PrimaryPart.Position or Vector3.new()
+    local targetDist = LocalPlayer:DistanceFromCharacter(targetPos)
+    local maxSpamRange = params.Ping + math.min(spd / 6.5, 95)
+    if params.EntityProps.Distance > maxSpamRange then return accuracy end
+    if params.BallProps.Distance > maxSpamRange then return accuracy end
+    if targetDist > maxSpamRange then return accuracy end
+    local maxSpeed = 5 - math.min(spd / 5, 5)
+    local adjDot = math.clamp(dot, -1, 0) * maxSpeed
+    accuracy = maxSpamRange - adjDot
+    return accuracy
+end
+
+-----------------------------------------------------------
+-- VISUALIZER SETUP
+-----------------------------------------------------------
+local visualEnabled = false
+local function getCharacter()
+    return LocalPlayer and LocalPlayer.Character
+end
+local function getPrimaryPart()
+    local c = getCharacter()
+    return c and c.PrimaryPart
+end
+local function getActiveBall()
+    local ballCont = Workspace:FindFirstChild("Balls")
+    if ballCont then
+        for _, b in ipairs(ballCont:GetChildren()) do
+            if not b.Anchored then 
+                return b 
+            end
+        end
+    end
+    return nil
+end
+local function computeVisualizerRadius()
+    local b = getActiveBall()
+    if b then
+        local v = b.Velocity.Magnitude
+        return math.clamp(v / 2.4 + 10, 15, 200)
+    end
+    return 15
+end
+local visPart = Instance.new("Part")
+visPart.Shape = Enum.PartType.Ball
+visPart.Anchored = true
+visPart.CanCollide = false
+visPart.Material = Enum.Material.ForceField
+visPart.Transparency = 0.5
+visPart.Parent = Workspace
+visPart.Size = Vector3.new(0, 0, 0)
+local function toggleVisualizer(state)
+    visualEnabled = state
+    if not state then 
+        visPart.Size = Vector3.new(0, 0, 0)
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    if not visualEnabled then return end
+    local prim = getPrimaryPart()
+    local b = getActiveBall()
+    if prim and b then
+        local rad = computeVisualizerRadius()
+        visPart.Size = Vector3.new(rad, rad, rad)
+        visPart.CFrame = prim.CFrame
+        visPart.Color = Color3.fromRGB(255, 255, 255)
+    else
+        visPart.Size = Vector3.new(0, 0, 0)
+    end
+end)
+
+-----------------------------------------------------------
+-- MANUAL SPAM GUI (Unchanged)
+-----------------------------------------------------------
+local connManager = {}
+local selectedParryMode = nil
+local parryFlag = false
+local lastParryTime = 0
+local MauaulSpam;
+function ManualSpam()
+    if MauaulSpam then
+        MauaulSpam:Destroy()
+        MauaulSpam = nil
+        return
+    end
+    MauaulSpam = Instance.new("ScreenGui")
+    MauaulSpam.Name = "MauaulSpam"
+    MauaulSpam.Parent = game.CoreGui
+    MauaulSpam.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    MauaulSpam.ResetOnSpawn = false
+    local Main = Instance.new("Frame")
+    Main.Name = "Main"
+    Main.Parent = MauaulSpam
+    Main.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    Main.BorderColor3 = Color3.fromRGB(0, 0, 0)
+    Main.BorderSizePixel = 0
+    Main.Position = UDim2.new(0.414, 0, 0.404, 0)
+    Main.Size = UDim2.new(0.227, 0, 0.191, 0)
+    local UICorner = Instance.new("UICorner")
+    UICorner.Parent = Main
+    local IndercantorBlahblah = Instance.new("Frame")
+    IndercantorBlahblah.Name = "IndercantorBlahblah"
+    IndercantorBlahblah.Parent = Main
+    IndercantorBlahblah.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+    IndercantorBlahblah.BorderColor3 = Color3.fromRGB(0, 0, 0)
+    IndercantorBlahblah.BorderSizePixel = 0
+    IndercantorBlahblah.Position = UDim2.new(0.028, 0, 0.073, 0)
+    IndercantorBlahblah.Size = UDim2.new(0.072, 0, 0.12, 0)
+    local UICorner_2 = Instance.new("UICorner")
+    UICorner_2.CornerRadius = UDim.new(1, 0)
+    UICorner_2.Parent = IndercantorBlahblah
+    local UIAspectRatioConstraint = Instance.new("UIAspectRatioConstraint")
+    UIAspectRatioConstraint.Parent = IndercantorBlahblah
+    local PC = Instance.new("TextLabel")
+    PC.Name = "PC"
+    PC.Parent = Main
+    PC.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    PC.BackgroundTransparency = 1
+    PC.BorderColor3 = Color3.fromRGB(0, 0, 0)
+    PC.BorderSizePixel = 0
+    PC.Position = UDim2.new(0.548, 0, 0.827, 0)
+    PC.Size = UDim2.new(0.452, 0, 0.173, 0)
+    PC.Font = Enum.Font.Unknown
+    PC.Text = "PC: E to spam"
+    PC.TextColor3 = Color3.fromRGB(57, 57, 57)
+    PC.TextScaled = true
+    PC.TextSize = 16
+    PC.TextWrapped = true
+    local UITextSizeConstraint = Instance.new("UITextSizeConstraint")
+    UITextSizeConstraint.Parent = PC
+    UITextSizeConstraint.MaxTextSize = 16
+    local UIAspectRatioConstraint_2 = Instance.new("UIAspectRatioConstraint")
+    UIAspectRatioConstraint_2.Parent = PC
+    UIAspectRatioConstraint_2.AspectRatio = 4.346
+    local IndercanotTextBlah = Instance.new("TextButton")
+    IndercanotTextBlah.Name = "IndercanotTextBlah"
+    IndercanotTextBlah.Parent = Main
+    IndercanotTextBlah.Active = false
+    IndercanotTextBlah.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    IndercanotTextBlah.BackgroundTransparency = 1
+    IndercanotTextBlah.BorderColor3 = Color3.fromRGB(0, 0, 0)
+    IndercanotTextBlah.BorderSizePixel = 0
+    IndercanotTextBlah.Position = UDim2.new(0.164, 0, 0.327, 0)
+    IndercanotTextBlah.Selectable = false
+    IndercanotTextBlah.Size = UDim2.new(0.668, 0, 0.347, 0)
+    IndercanotTextBlah.Font = Enum.Font.GothamBold
+    IndercanotTextBlah.Text = "Spam"
+    IndercanotTextBlah.TextColor3 = Color3.new(1, 1, 1)
+    IndercanotTextBlah.TextScaled = true
+    IndercanotTextBlah.TextSize = 24
+    IndercanotTextBlah.TextWrapped = true
+    local UIGradient = Instance.new("UIGradient", IndercanotTextBlah)
+    UIGradient.Color = ColorSequence.new({
+      ColorSequenceKeypoint.new(0, Color3.new(0, 0, 0)),
+      ColorSequenceKeypoint.new(0.75, Color3.fromRGB(255, 0, 4)),
+      ColorSequenceKeypoint.new(1, Color3.new(0, 0, 0))
+    })
+    local UITextSizeConstraint_2 = Instance.new("UITextSizeConstraint", IndercanotTextBlah)
+    UITextSizeConstraint_2.MaxTextSize = 52
+    local UIAspectRatioConstraint_3 = Instance.new("UIAspectRatioConstraint", IndercanotTextBlah)
+    UIAspectRatioConstraint_3.AspectRatio = 3.212
+    local UIAspectRatioConstraint_4 = Instance.new("UIAspectRatioConstraint", Main)
+    UIAspectRatioConstraint_4.AspectRatio = 1.667
+    -- [Drag functionality omitted for brevity]
+end
+
+ManualSpam()
+
+-----------------------------------------------------------
+-- LOAD EXTERNAL LIBRARY AND SETUP UI TABS
+-----------------------------------------------------------
+local function loadExternalLib(url)
+    local success, lib = pcall(function() return loadstring(game:HttpGet(url))() end)
+    if not success then
+        warn("Failed to load library from " .. url)
+        return nil
+    end
+    return lib
+end
+
+local externalLib = loadExternalLib("https://pastebin.com/raw/nLwfv2jz")
+local mainLib = externalLib.__init()
+
+-- CREATE TABS
+local mainTab   = mainLib.create_tab("Main")
+local detectTab = mainLib.create_tab("Detection")
+
+-----------------------------------------------------------
+-- MAIN TAB SETUP
+-----------------------------------------------------------
+mainTab.create_title({ name = "Combat", section = "left" })
+mainTab.create_description_toggle({
+  name = "Auto Parry",
+  description = "Automatically parries incoming balls",
+  flag = "pr",
+  enabled = false,
+  section = "left",
+  callback = function(state)
+    if state then
+      connManager["Auto Parry"] = RunService.PreSimulation:Connect(function()
+        local ball = AutoParry.fetchBall()
+        local ballList = AutoParry.fetchBalls()
+        for _, b in ipairs(ballList) do
+          if not b then repeat task.wait() until b end
+          local zoom = b:FindFirstChild("zoomies")
+          if not zoom then return end
+          b:GetAttributeChangedSignal("target"):Once(function() parryFlag = false end)
+          if parryFlag then return end
+          local ballTarget = b:GetAttribute("target")
+          local primaryTarget = ball and ball:GetAttribute("target")
+          local vel = zoom.VectorVelocity
+          local dist = (LocalPlayer.Character.PrimaryPart.Position - b.Position).Magnitude
+          local spd = vel.Magnitude
+          local ping = Stats.Network.ServerStatsItem["Data Ping"]:GetValue() / 10
+          local parryThresh = (spd / 3.25) + ping
+          local curved = AutoParry.detectCurve()
+          if ballTarget == tostring(LocalPlayer) and getgenv().Aerodynamic then
+            if tick() - (getgenv().AerodynamicTime or 0) > 0.6 then
+              getgenv().AerodynamicTime = tick()
+              getgenv().Aerodynamic = false
+            end
+            return
+          end
+          if primaryTarget == tostring(LocalPlayer) and curved then 
+            return 
+          end
+          if ballTarget == tostring(LocalPlayer) and dist <= parryThresh then
+            AutoParry.triggerParry(selectedParryMode)
+            parryFlag = true
+          end
+          local lastCycle = tick()
+          repeat 
+            RunService.PreSimulation:Wait() 
+          until (tick() - lastCycle) >= 1 or not parryFlag
+          parryFlag = false
+        end
+      end)
+    else
+      if connManager["Auto Parry"] then
+        connManager["Auto Parry"]:Disconnect()
+        connManager["Auto Parry"] = nil
+      end
+    end
+  end
+})
+mainTab.create_description_toggle({
+  name = "Auto Spam",
+  description = "Automatically spams when conditions are met",
+  flag = "Spams",
+  enabled = false,
+  section = "left",
+  callback = function(state)
+    if state then
+      connManager["Auto Spam"] = RunService.PreSimulation:Connect(function()
+        local b = AutoParry.fetchBall()
+        if not b then return end
+        local zoom = b:FindFirstChild("zoomies")
+        if not zoom then return end
+        AutoParry.findNearestEntity()
+        local pingVal = Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+        local pThreshold = math.clamp(pingVal/10, 10, 16)
+        local ballProps = AutoParry.getBallProperties()
+        local entityProps = AutoParry.getEntityProperties()
+        local spamAcc = AutoParry.computeSpamAccuracy({
+          BallProps = ballProps,
+          EntityProps = entityProps,
+          Ping = pThreshold
+        })
+        local d = LocalPlayer:DistanceFromCharacter(b.Position)
+        if d <= spamAcc and parryCounter > 1 then
+          AutoParry.triggerParry(selectedParryMode)
+        end
+      end)
+    else
+      if connManager["Auto Spam"] then
+        connManager["Auto Spam"]:Disconnect()
+        connManager["Auto Spam"] = nil
+      end
+    end
+  end
+})
+mainTab.create_dropdown({
+  name = "Curve Position",
+  flag = "po",
+  section = "left",
+  option = "Custom",
+  options = {"Custom", "Random", "Backwards", "Straight", "Up", "Right", "Left", "Dot"},
+  callback = function(selection)
+    selectedParryMode = selection
+  end
+})
+mainTab.create_title({ name = " No Render", section = "left" })
+mainTab.create_description_toggle({
+  name = "Enebled", 
+  description = "Removes every sfx and optimises the fps",
+  flag = "No_Render_Toggle", 
+  enabled = false,
+  section = "left", 
+  callback = function(state)
+    LocalPlayer.PlayerScripts.EffectScripts.ClientFX.Disabled = state
+    if state then
+      Norender = Workspace.Runtime.ChildAdded:Connect(function(Value)
+        Debris:AddItem(Value, 0)
+      end)
+    else
+      if Norender then
+        Norender:Disconnect()
+        Norender = nil
+      end
+    end
+  end
+})
+mainTab.create_title({ name = " Frame", section = "left" })
+mainTab.create_slider({
+  name = "Customise Fps",
+  flag = "fps",
+  section = "left",
+  value = 150,
+  minimum_value = 0,
+  maximum_value = 500,
+  callback = function(val) setfpscap(val) end
+})
+mainTab.create_slider({
+  name = "Spam Threshold",
+  flag = "spam_threshold",
+  section = "right",
+  value = 0.2,
+  minimum_value = 0.1,
+  maximum_value = 5,
+  callback = function(val)
+    spamThreshold = val
+  end
+})
+mainTab.create_title({ name = " Parry Settings", section = "right" })
+mainTab.create_dropdown({
+  name = "Parry Method",
+  flag = "meyh",
+  section = "right",
+  option = "Remote",
+  options = {"Remote", "Keypress"},
+  callback = function(selection)
+    activeMethod = selection
+  end
+})
+activeMethod = "Remote"
+mainTab.create_slider({
+  name = "Parry Accuracy",
+  flag = "sli",
+  section = "right",
+  value = 50,
+  minimum_value = 0,
+  maximum_value = 100,
+  callback = function(val)
+    local adjusted = val / 5.5
+    getgenv().Parry_Accuracy = adjusted
+  end
+})
+mainTab.create_title({ name = " Ping Settings", section = "right" })
+mainTab.create_description_toggle({
+  name = "Ping-based Parry",
+  description = "Adjust parry thresholds based on player's ping",
+  flag = "ping_parry",
+  enabled = getgenv().PingBasedParry,
+  section = "right",
+  callback = function(state)
+    getgenv().PingBasedParry = state
+  end
+})
+mainTab.create_title({ name = " Spam Settings", section = "right" })
+mainTab.create_description_toggle({
+  name = "Manual Spam",
+  description = "A GUI for manual spam control",
+  flag = "zp",
+  enabled = false,
+  section = "right",
+  callback = function(state) ManualSpam() end
+})
+detectTab.create_description_toggle({
+  name = "Singularity Detection",
+  description = "Prevents parry if SingularityCape is detected",
+  flag = "singularity_detection",
+  enabled = false,
+  section = "left",
+  callback = function(state) getgenv().SingularityDetectionEnabled = state end
+})
+mainTab.create_title({ name = "Visualizer", section = "left" })
+mainTab.create_description_toggle({
+  name = "Enabled",
+  description = "Displays the auto parry's range",
+  flag = "visualis",
+  enabled = false,
+  section = "left",
+  callback = function(state) toggleVisualizer(state) end
+})
+
+-----------------------------------------------------------
+-- REMOTE EVENT RESPONSES
+-----------------------------------------------------------
+ReplicatedStore.Remotes.ParrySuccessAll.OnClientEvent:Connect(function(_, root)
+  if root.Parent and root.Parent ~= LocalPlayer.Character then
+    if root.Parent.Parent ~= AliveGroup then return end
+  end
+  AutoParry.findNearestEntity()
+  local b = AutoParry.fetchBall()
+  if not b then return end
+  if not parryAnimation then return end
+  parryAnimation:Stop()
+end)
+
+ReplicatedStore.Remotes.ParrySuccess.OnClientEvent:Connect(function()
+  if LocalPlayer.Character.Parent ~= AliveGroup then return end
+  if not parryAnimation then return end
+  parryAnimation:Stop()
+end)
+
+Workspace.Runtime.ChildAdded:Connect(function(child)
+  if child.Name == "Tornado" then
+    getgenv().AerodynamicTime = tick()
+    getgenv().Aerodynamic = true
+  end
+end)
+
+Workspace.Balls.ChildAdded:Connect(function()
+  parryFlag = false
+end)
+
+Workspace.Balls.ChildRemoved:Connect(function()
+  parryCounter = 0
+  parryFlag = false
+  if connManager["Target Change"] then
+    connManager["Target Change"]:Disconnect()
+    connManager["Target Change"] = nil
+  end
+end)
